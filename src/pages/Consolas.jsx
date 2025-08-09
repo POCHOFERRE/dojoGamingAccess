@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from 'react'
+// src/pages/Consolas.jsx
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useBookings } from '@/context/BookingsContext.jsx'
 import { useAuth } from '@/context/AuthContext'
 import TimeSlotPicker from '@/components/TimeSlotPicker.jsx'
 import PaymentModal from '@/components/PaymentModal.jsx'
-import { FaPlaystation, FaXbox, FaGamepad, FaCarSide } from 'react-icons/fa'
+import { FaPlaystation, FaXbox, FaGamepad, FaCarSide, FaChevronLeft, FaChevronRight } from 'react-icons/fa'
 
-// Fallback local por si tu contexto aún no trae recursos
+/* ---------- Datos (fallback si tu contexto aún no trae recursos) ---------- */
 const DEFAULT_RESOURCES = [
   { id:'ps5-01', name:'PS5 #1', type:'ps5', price:6500, active:true, bufferMins:5 },
   { id:'ps5-02', name:'PS5 #2', type:'ps5', price:6500, active:true, bufferMins:5 },
@@ -19,9 +20,10 @@ const DEFAULT_RESOURCES = [
   { id:'ps4-03', name:'PS4 #3', type:'ps4', price:5500, active:true, bufferMins:5 },
   { id:'ps4-04', name:'PS4 #4', type:'ps4', price:5500, active:true, bufferMins:5 },
   { id:'sim-01', name:'Simulador #1', type:'simulador', price:6000, active:true, bufferMins:10 },
-  { id:'sim-02', name:'Simulador #2', type:'simulador', price:6000, active:true, bufferMins:10 }, // 👈 agregado
+  { id:'sim-02', name:'Simulador #2', type:'simulador', price:6000, active:true, bufferMins:10 },
 ]
 
+/* ---------- Helpers ---------- */
 const normType = (t='') => {
   const v = String(t).toLowerCase()
   if (v.includes('ps5')) return 'ps5'
@@ -40,6 +42,181 @@ const Icon = ({ type }) => {
   return <FaGamepad />
 }
 
+/* ---------- Carousel GBA Color ---------- */
+function GbaCarousel({ items, selectedId, onSelect }) {
+  const trackRef = useRef(null)
+  const [isMobile, setIsMobile] = useState(false)
+
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth <= 768)
+    check()
+    window.addEventListener('resize', check)
+    return () => window.removeEventListener('resize', check)
+  }, [])
+
+  const scrollToItem = (id, smooth = true) => {
+    const wrap = trackRef.current
+    const el = wrap?.querySelector(`[data-id="${id}"]`)
+    if (!wrap || !el) return
+    const wrapRect = wrap.getBoundingClientRect()
+    const elRect = el.getBoundingClientRect()
+    const delta =
+      elRect.left +
+      elRect.width / 2 -
+      (wrapRect.left + wrapRect.width / 2)
+    wrap.scrollBy({ left: delta, behavior: smooth ? 'smooth' : 'auto' })
+  }
+
+  useEffect(() => {
+    if (selectedId) scrollToItem(selectedId)
+  }, [selectedId])
+
+  const onPointerDown = (e) => {
+    const wrap = trackRef.current
+    if (!wrap) return
+    wrap.dataset.dragging = "true"
+    wrap.dataset.startX = e.clientX ?? e.touches?.[0]?.clientX
+    wrap.dataset.scrollLeft = wrap.scrollLeft
+  }
+
+  const onPointerMove = (e) => {
+    const wrap = trackRef.current
+    if (!wrap || wrap.dataset.dragging !== "true") return
+    const x = e.clientX ?? e.touches?.[0]?.clientX
+    const dx = wrap.dataset.startX - x
+    wrap.scrollLeft = parseInt(wrap.dataset.scrollLeft) + dx
+  }
+
+  const onPointerUp = () => {
+    const wrap = trackRef.current
+    if (wrap) wrap.dataset.dragging = "false"
+  }
+
+  return (
+    <div className="gba-carousel">
+      {!isMobile && (
+        <button className="nav left" onClick={() => scrollToItem(items[0]?.id)}>
+          ◀
+        </button>
+      )}
+
+      <div
+        className="track"
+        ref={trackRef}
+        onMouseDown={onPointerDown}
+        onMouseMove={onPointerMove}
+        onMouseUp={onPointerUp}
+        onMouseLeave={onPointerUp}
+        onTouchStart={onPointerDown}
+        onTouchMove={onPointerMove}
+        onTouchEnd={onPointerUp}
+      >
+        {items.map((r) => (
+          <button
+            key={r.id}
+            data-id={r.id}
+            onClick={() => onSelect(r.id)}
+            className={`gba-card-tile ${selectedId === r.id ? 'active' : ''}`}
+          >
+            <div className="icon"><Icon type={r.type} /></div>
+            <div className="info">
+              <div className="name">{r.name}</div>
+              <div className="meta">{normType(r.type).toUpperCase()}</div>
+            </div>
+            <div className="price">${r.price}/h</div>
+          </button>
+        ))}
+      </div>
+
+      {!isMobile && (
+        <button className="nav right" onClick={() => scrollToItem(items[items.length - 1]?.id)}>
+          ▶
+        </button>
+      )}
+
+      <style jsx>{`
+        .gba-carousel {
+          position: relative;
+          padding: 8px;
+        }
+        .track {
+          display: flex;
+          gap: 14px;
+          overflow-x: auto;
+          scroll-snap-type: x mandatory;
+          scrollbar-width: none;
+        }
+        .track::-webkit-scrollbar {
+          display: none;
+        }
+        .gba-card-tile {
+          scroll-snap-align: center;
+          min-width: 300px;
+          max-width: 320px;
+          min-height: 140px;
+          display: grid;
+          grid-template-columns: 50px 1fr auto;
+          align-items: center;
+          gap: 10px;
+          padding: 14px;
+          border-radius: 14px;
+          border: 2px solid #4a2fb6;
+          background: linear-gradient(180deg, rgba(19,8,47,.85), rgba(10,7,28,.9));
+          color: #e8e6ff;
+          box-shadow: 0 8px 18px rgba(0,0,0,.45);
+          word-break: break-word;
+        }
+        .gba-card-tile .icon {
+          font-size: 26px;
+        }
+        .gba-card-tile .name {
+          font-weight: bold;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .gba-card-tile .meta {
+          font-size: 13px;
+          opacity: 0.85;
+        }
+        .price {
+          font-weight: bold;
+          font-size: 14px;
+          color: #ffe48a;
+        }
+        .nav {
+          position: absolute;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 36px;
+          height: 36px;
+          border-radius: 50%;
+          border: none;
+          background: #8f78ff;
+          color: white;
+        }
+        .nav.left {
+          left: 0;
+        }
+        .nav.right {
+          right: 0;
+        }
+        @media (max-width: 768px) {
+          .nav {
+            display: none;
+          }
+          .gba-card-tile {
+            min-width: 85%;
+            max-width: 85%;
+            min-height: 160px;
+          }
+        }
+      `}</style>
+    </div>
+  )
+}
+
+/* ---------- Página ---------- */
 export default function Consolas(){
   const { user } = useAuth()
   const { resources, bookings } = useBookings()
@@ -51,19 +228,19 @@ export default function Consolas(){
 
   const [resourceId, setResourceId] = useState(null)
   useEffect(() => { if (!resourceId && effectiveResources.length) setResourceId(effectiveResources[0].id) }, [effectiveResources, resourceId])
+
   const selected = useMemo(() => effectiveResources.find(r => r.id === resourceId) || null, [effectiveResources, resourceId])
   const selectedType = normType(selected?.type)
 
-  // 👉 control Joysticks solo para PS4
+  // PS4: joysticks (1 ó 2) con recargo
   const [joysticks, setJoysticks] = useState(1)
-  useEffect(() => { if (selectedType !== 'ps4') setJoysticks(1) }, [selectedType]) // resetea si cambias de tipo
+  useEffect(() => { if (selectedType !== 'ps4') setJoysticks(1) }, [selectedType])
 
-  // Modal de pago
+  // Pago
   const [showPay, setShowPay] = useState(false)
   const [reservation, setReservation] = useState(null)
 
-  // precio por hora (PS4 con 2 joysticks suma $500/h)
-  const pricePreview = (startIso, durationMins) => {
+  const pricePreview = (_iso, durationMins) => {
     if (!selected?.price) return undefined
     let base = selected.price
     if (selectedType === 'ps4' && joysticks === 2) base += 500
@@ -72,51 +249,26 @@ export default function Consolas(){
 
   return (
     <div className="screen" style={{ padding: 12, maxWidth: 1140, margin: '0 auto' }}>
-      <div className="card" style={{ marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>Elegí tu consola/simulador</h2>
-        <div className="list" style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(220px, 1fr))', gap:10, marginTop:10 }}>
-          {effectiveResources.map(r => {
-            const active = r.id === resourceId
-            return (
-              <button key={r.id} onClick={() => setResourceId(r.id)}
-                className={`tile ${active ? 'active' : ''}`}
-                style={{ textAlign:'left', display:'grid', gridTemplateColumns:'28px 1fr auto', gap:10, alignItems:'center',
-                         padding:'10px 12px', borderRadius:10, border:`1px solid ${active?'#5fc':'#2a3b44'}`, background: active ? '#0f3340' : '#0b1e26', color:'#def' }}>
-                <div style={{ fontSize:22 }}><Icon type={r.type} /></div>
-                <div style={{ minWidth:0 }}>
-                  <div style={{ fontWeight:800, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{r.name}</div>
-                  <div style={{ opacity:.85, fontSize:13 }}>{normType(r.type).toUpperCase()}</div>
-                </div>
-                <div style={{ fontWeight:900 }}>${r.price}/h</div>
-              </button>
-            )
-          })}
-        </div>
+      <div className="card-outer">
+        <h2 className="title">Elegí tu consola/simulador</h2>
+        <GbaCarousel
+          items={effectiveResources}
+          selectedId={resourceId}
+          onSelect={(id) => setResourceId(id)}
+        />
       </div>
 
       {selected && (
-        <div className="card">
-          <h3 style={{ marginTop: 0 }}>{selected.name}: reservá tu turno</h3>
+        <div className="card-outer">
+          <h3 className="title" style={{ marginTop: 0 }}>{selected.name}: reservá tu turno</h3>
 
           {selectedType === 'ps4' && (
-            <div style={{ marginBottom: 10, display:'flex', gap:10, alignItems:'center' }}>
-              <label style={{ opacity:.9 }}>Joysticks (PS4):</label>
-              <div style={{ display:'flex', gap:6 }}>
-                <button
-                  type="button"
-                  onClick={() => setJoysticks(1)}
-                  className={`seg ${joysticks===1 ? 'active' : ''}`}
-                >1</button>
-                <button
-                  type="button"
-                  onClick={() => setJoysticks(2)}
-                  className={`seg ${joysticks===2 ? 'active' : ''}`}
-                >2 (+$500/h)</button>
+            <div className="joy-wrap">
+              <span>Joysticks (PS4):</span>
+              <div className="joy-seg">
+                <button type="button" onClick={()=>setJoysticks(1)} className={joysticks===1?'active':''}>1</button>
+                <button type="button" onClick={()=>setJoysticks(2)} className={joysticks===2?'active':''}>2 (+$500/h)</button>
               </div>
-              <style jsx>{`
-                .seg{background:#123;border:1px solid #345;color:#cfe;padding:6px 10px;border-radius:8px}
-                .seg.active{background:#0f3340;border-color:#5fc;box-shadow:0 0 0 2px #5fc inset}
-              `}</style>
             </div>
           )}
 
@@ -130,9 +282,8 @@ export default function Consolas(){
             pricePerHour={selected.price}
             bufferMins={Number(selected.bufferMins || 0)}
             alias="dojovcp"
-            mpLink="https://mpago.la/tu-link"  // reemplazalo por tu link real o dinámico
+            mpLink="https://mpago.la/tu-link"  // cambialo por el real
             compact
-            // 👇 guardamos joysticks en el booking (meta)
             meta={selectedType==='ps4' ? { joysticks } : null}
             onConfirmed={(res) => { setReservation(res); setShowPay(true) }}
           />
@@ -146,9 +297,28 @@ export default function Consolas(){
         onSuccess={() => { setReservation(null) }}
       />
 
+      {/* skin GBA Color (contenedores) */}
       <style jsx>{`
-        .card{background:#0a1a22;border:1px solid #243844;border-radius:12px;padding:12px;color:#dff3ff;box-shadow:0 8px 24px rgba(0,0,0,.3)}
-        .tile:hover{filter:brightness(1.06)}
+        .card-outer{
+          background:
+            radial-gradient(120% 120% at 100% 0%, rgba(255,255,255,.05), transparent 40%),
+            linear-gradient(135deg,#2b165c 0%, #1e1045 60%, #140b33 100%);
+          border:2px solid #4b2dc5;
+          border-radius:16px;
+          padding:12px;
+          color:#eae6ff;
+          box-shadow: 0 10px 26px rgba(0,0,0,.45), inset 0 0 0 2px rgba(255,255,255,.04);
+          margin-bottom: 12px;
+        }
+        .title{ margin:0 0 8px 0; letter-spacing:.3px; color:#efe9ff; text-shadow:0 1px 0 rgba(0,0,0,.4) }
+        .joy-wrap{ display:flex; align-items:center; gap:10px; margin-bottom:10px; color:#d8ccff }
+        .joy-seg{ display:flex; gap:6px }
+        .joy-seg button{
+          background:#1b1140; color:#e9e3ff; border:1px solid #5642b8; border-radius:10px; padding:6px 10px
+        }
+        .joy-seg button.active{
+          background:#2d1f6e; border-color:#b79cff; box-shadow:0 0 0 2px rgba(183,156,255,.2) inset
+        }
       `}</style>
     </div>
   )

@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
-import { addMinutes, format, setHours, setMinutes, isAfter, isSameDay } from 'date-fns'
+import { addMinutes, format, setHours, setMinutes } from 'date-fns'
 import { FaClock, FaCheck, FaTimes, FaCopy, FaSpinner } from 'react-icons/fa'
 import QRCode from 'qrcode'
 import { nanoid } from 'nanoid'
@@ -12,15 +12,15 @@ import {
   serverTimestamp, Timestamp, getDocs
 } from 'firebase/firestore'
 
-// —— Helper solapamiento
+// —— overlap con buffer
 const overlapsRange = (startA, endA, startB, endB, bufferMins = 0) => {
   const bufferMs = bufferMins * 60 * 1000
   return !((endA <= startB - bufferMs) || (startA >= endB + bufferMs))
 }
 const HRS = (h) => h.toString().padStart(2, '0') + ':00'
-const DURATIONS = [30, 45, 60, 90, 120] // minutos
+const DURATIONS = [30, 45, 60, 90, 120] // min
 
-// 🔧 crea booking si no hay solapamiento (TRANSACCIÓN) — usa getDocs fuera de tx
+// 🔧 transacción: anti-solape
 async function createBookingIfFree({
   code, userId, resourceId, startIso, endIso,
   alias = 'dojovcp', mpLink = '', price = 0, bufferMins = 0, qrPayload = {}, meta = null
@@ -32,19 +32,18 @@ async function createBookingIfFree({
   const windowStart = Timestamp.fromMillis(start.getTime() - bufferMins*60*1000)
   const windowEnd   = Timestamp.fromMillis(end.getTime()   + bufferMins*60*1000)
 
-  // 1) PRE-QUERY fuera de la transacción
+  // query previa
   const qy = query(
     bookingsRef,
     where('resourceId','==', resourceId),
+    where('start','>=', windowStart),
     where('start','<=', windowEnd),
     orderBy('start','asc')
   )
   const preSnap = await getDocs(qy)
 
-  // 2) Transacción: revalidar doc por doc y luego escribir
   const bookingId = await runTransaction(db, async (tx) => {
     const sMs = start.getTime(), eMs = end.getTime()
-
     for (const d of preSnap.docs) {
       const ref = doc(db, 'bookings', d.id)
       const fresh = await tx.get(ref)
@@ -52,11 +51,8 @@ async function createBookingIfFree({
       const b = fresh.data()
       if (!['pending','paid','checked_in'].includes(b.status)) continue
       const bs = b.start.toMillis(), be = b.end.toMillis()
-      if (be >= windowStart.toMillis()) {
-        if (overlapsRange(sMs, eMs, bs, be, bufferMins)) throw new Error('OVERLAP')
-      }
+      if (overlapsRange(sMs, eMs, bs, be, bufferMins)) throw new Error('OVERLAP')
     }
-
     const newRef = doc(bookingsRef)
     tx.set(newRef, {
       code, userId, resourceId,
@@ -64,17 +60,15 @@ async function createBookingIfFree({
       end:   Timestamp.fromDate(end),
       status: 'pending', price, alias, mpLink,
       createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
-      qrPayload,
-      meta: meta || null
+      qrPayload, meta: meta || null
     })
     return newRef.id
   })
-
   return bookingId
 }
 
-// Normaliza reservas (Timestamp | ISO | Date)
-function normalizeBooking(b) {
+// normaliza start/end a ms
+const normalizeBooking = (b) => {
   const toMs = (v) => (typeof v?.toMillis==='function' ? v.toMillis() : (v instanceof Date ? v.getTime() : new Date(v).getTime()))
   return { ...b, startMs: toMs(b.start), endMs: toMs(b.end) }
 }
@@ -86,9 +80,10 @@ export default function TimeSlotPicker({
   durationMins = 60,
   intervalMins = 15,
   pricePerHour = 8000,
+  respectNow = false,      // 👈 por defecto NO bloquea por hora actual
   pricePreview,            // (startIso, durationMins) => number | undefined
-  onSelect,                // opcional (cuando clickeás slot)
-  onConfirmed,             // callback cuando se crea la reserva
+  onSelect,
+  onConfirmed,
   bookings = [],
   resourceId,
   user,
@@ -97,7 +92,7 @@ export default function TimeSlotPicker({
   mpLink = '',
   bufferMins = 0,
   alias = 'dojovcp',
-  meta = null             // 👈 NUEVO: se guarda en el booking y vuelve en onConfirmed
+  meta = null
 }) {
   const [duration, setDuration] = useState(durationMins)
   useEffect(() => setDuration(durationMins), [durationMins])
@@ -105,19 +100,21 @@ export default function TimeSlotPicker({
   const [selectedIso, setSelectedIso] = useState(null)
   const [selectedEndIso, setSelectedEndIso] = useState(null)
   const [selectedLabel, setSelectedLabel] = useState('')
-  const [now, setNow] = useState(new Date())
   const [qrDataUrl, setQrDataUrl] = useState(null)
   const [reserveCode, setReserveCode] = useState('')
   const [confirmedId, setConfirmedId] = useState(null)
   const [isProcessing, setIsProcessing] = useState(false)
   const [hourChosen, setHourChosen] = useState(null) // "HH:00"
-  const beepCtxRef = useRef(null)
 
+  const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 30000)
+    if (!respectNow) return
+    const t = setInterval(() => setNow(Date.now()), 30000)
     return () => clearInterval(t)
-  }, [])
+  }, [respectNow])
 
+  // beep
+  const beepCtxRef = useRef(null)
   const beep = () => {
     if (!sound) return
     try {
@@ -129,17 +126,16 @@ export default function TimeSlotPicker({
     } catch {}
   }
 
-  // Slots del día
+  // ✅ Genera TODOS los slots del rango (no filtra por now)
   const slots = useMemo(() => {
     const startDay = setMinutes(setHours(date, openHour), 0)
     const endDay   = setMinutes(setHours(date, closeHour), 0)
     const arr = []
     for (let t = startDay; t < endDay; t = addMinutes(t, intervalMins)) {
       const slotEnd = addMinutes(t, duration)
-      if (slotEnd <= endDay && (isSameDay(t, now) ? isAfter(t, now) : true)) {
+      if (slotEnd <= endDay) {
         const start = new Date(t); const end = slotEnd
-        arr.push({
-          start, end,
+        arr.push({ start, end,
           startIso: start.toISOString(),
           endIso: end.toISOString(),
           startMs: start.getTime(),
@@ -148,9 +144,9 @@ export default function TimeSlotPicker({
       }
     }
     return arr
-  }, [date, duration, intervalMins, now, openHour, closeHour])
+  }, [date, duration, intervalMins, openHour, closeHour])
 
-  // Reservas del día
+  // reservas del día SOLO del recurso actual
   const todays = useMemo(() => {
     if (!resourceId || !Array.isArray(bookings)) return []
     const dayStr = date.toDateString()
@@ -160,20 +156,23 @@ export default function TimeSlotPicker({
       .filter(b => new Date(b.startMs).toDateString() === dayStr)
   }, [bookings, resourceId, date])
 
-  // Disponibilidad por slot
+  // disponibilidad por slot: libre si no solapa; opcionalmente bloquea pasados
   const availability = useMemo(() => {
     const map = new Map()
     for (const s of slots) {
-      let free = true
-      for (const b of todays) {
-        if (overlapsRange(s.startMs, s.endMs, b.startMs, b.endMs, bufferMins)) { free = false; break }
+      const isPast = respectNow ? s.startMs < now : false
+      let free = !isPast
+      if (free) {
+        for (const b of todays) {
+          if (overlapsRange(s.startMs, s.endMs, b.startMs, b.endMs, bufferMins)) { free = false; break }
+        }
       }
       map.set(s.startIso, free)
     }
     return map
-  }, [slots, todays, bufferMins])
+  }, [slots, todays, bufferMins, now, respectNow])
 
-  // Mostrar TODAS las horas 14..22 (deshabilitando las sin lugar)
+  // buckets por hora + conteo libres
   const hourBuckets = useMemo(() => {
     const g = new Map()
     for (const s of slots) {
@@ -190,16 +189,13 @@ export default function TimeSlotPicker({
     })
   }, [slots, availability, openHour, closeHour])
 
-  // Dial (rueda gamer)
-  const dialPositions = useMemo(() => {
-    const size = 160, cx = size/2, cy = size/2, r = 56, n = DURATIONS.length, startDeg = -90
-    return DURATIONS.map((d, i) => {
-      const ang = (startDeg + (360/n)*i) * Math.PI/180
-      const x = cx + r * Math.cos(ang) - 20
-      const y = cy + r * Math.sin(ang) - 20
-      return { d, left: `${x}px`, top: `${y}px` }
-    })
-  }, [])
+  // auto-elegir primera hora con disponibilidad (UX)
+  useEffect(() => {
+    if (hourBuckets.length && !hourChosen) {
+      const first = hourBuckets.find(h => h.available.length > 0)
+      if (first) setHourChosen(first.hour)
+    }
+  }, [hourBuckets, hourChosen])
 
   const onPickDuration = (d) => {
     if (d === duration) return
@@ -227,7 +223,7 @@ export default function TimeSlotPicker({
     setQrDataUrl(null); setReserveCode(''); setSelectedIso(null); setSelectedEndIso(null); setSelectedLabel(''); setConfirmedId(null)
   }, [])
 
-  // Precio con fallback
+  // precio
   const selectedPrice = useMemo(() => {
     if (!selectedIso) return null
     let v = typeof pricePreview === 'function' ? pricePreview(selectedIso, duration) : undefined
@@ -236,6 +232,7 @@ export default function TimeSlotPicker({
     return n
   }, [selectedIso, pricePreview, pricePerHour, duration])
 
+  // confirmar (crea en Firestore + abre modal mediante onConfirmed)
   const confirmReservation = async () => {
     if (!selectedIso || !selectedEndIso) { toast.error('Elegí un turno'); return }
     if (!user?.uid) { toast.error('Iniciá sesión'); return }
@@ -296,58 +293,68 @@ export default function TimeSlotPicker({
     <div className={`time-slot-picker gba-card crt ${compact ? 'compact' : ''}`}>
       <header className="header">
         <div className="title pixel"><FaClock /> <span>Reservá tu turno</span></div>
-        <div className="sub pixel">
-          {format(date, 'EEEE d/MM')} • {openHour}:00–{closeHour}:00
-        </div>
+        <div className="sub pixel">{format(date, 'EEEE d/MM')} • {openHour}:00–{closeHour}:00</div>
       </header>
 
-      {/* Duración - ruedita */}
+      {/* Duración - rueda */}
       <div className="section pixel">
         <div className="label">Duración</div>
         <div className="dial" role="listbox" aria-label="Duración">
           <div className="dial-center"><div className="dial-value">{duration}<small>min</small></div></div>
-          {dialPositions.map(({ d, left, top }) => {
-            const active = d === duration
+          {(() => {
+            const size = 160, cx = size/2, cy = size/2, r = 56, n = DURATIONS.length, startDeg = -90
+            return DURATIONS.map((d, i) => {
+              const ang = (startDeg + (360/n)*i) * Math.PI/180
+              const x = cx + r * Math.cos(ang) - 20
+              const y = cy + r * Math.sin(ang) - 20
+              const active = d === duration
+              return (
+                <button key={d} className={`dial-item ${active ? 'active' : ''}`}
+                  style={{ left:`${x}px`, top:`${y}px` }} onClick={() => onPickDuration(d)}
+                  role="option" aria-selected={active} title={`${d} minutos`}>{d}</button>
+              )
+            })
+          })()}
+        </div>
+      </div>
+
+      {/* Paso 1 */}
+      <div className="step pixel">1) Elegí la <strong>HORA</strong></div>
+      <div className="hours-container">
+        <div className="hours-row">
+          {hourBuckets.map(({ hour, available }) => {
+            const active = hour === hourChosen
+            const disabled = available.length === 0
             return (
-              <button key={d} className={`dial-item ${active ? 'active' : ''}`} style={{ left, top }} onClick={() => onPickDuration(d)} role="option" aria-selected={active} title={`${d} minutos`}>{d}</button>
+              <button
+                key={hour}
+                className={`hour-chip ${active ? 'active' : ''}`}
+                disabled={disabled}
+                onClick={() => { const next = active ? null : hour; setHourChosen(next); setSelectedIso(null); setSelectedEndIso(null); setSelectedLabel(''); setConfirmedId(null); beep() }}
+                title={`${hour} · ${available.length} libres`}
+              >
+                {hour}<span className="badge">{available.length}</span>
+              </button>
             )
           })}
         </div>
       </div>
 
-      {/* Paso 1: Hora */}
-      <div className="step pixel">1) Elegí la <strong>HORA</strong></div>
-      <div className="hours-row">
-        {hourBuckets.map(({ hour, available }) => {
-          const active = hour === hourChosen
-          const disabled = available.length === 0
-          return (
-            <button
-              key={hour}
-              className={`hour-chip ${active ? 'active' : ''}`}
-              disabled={disabled}
-              onClick={() => { const next = active ? null : hour; setHourChosen(next); setSelectedIso(null); setSelectedEndIso(null); setSelectedLabel(''); setConfirmedId(null); beep() }}
-              title={`${hour} · ${available.length} libres`}
-            >
-              {hour}<span className="badge">{available.length}</span>
-            </button>
-          )
-        })}
-      </div>
-
-      {/* Paso 2: Turno */}
+      {/* Paso 2 */}
       <div className="step pixel" style={{marginTop:8}}>2) Elegí el <strong>TURNO</strong></div>
       {hourChosen && (
-        <div className="slots-row">
-          {hourBuckets.find(h => h.hour === hourChosen)?.slots.map((s) => {
-            const free = availability.get(s.startIso)
-            const sel = selectedIso === s.startIso
-            return (
-              <button key={s.startIso} className={`slot-btn ${free ? 'free' : 'busy'} ${sel ? 'selected' : ''}`} disabled={!free} onClick={() => pick(s)} title={`${format(s.start,'HH:mm')}–${format(s.end,'HH:mm')}`}>
-                {format(s.start,'HH:mm')}
-              </button>
-            )
-          })}
+        <div className="slots-container">
+          <div className="slots-row">
+            {hourBuckets.find(h => h.hour === hourChosen)?.slots.map((s) => {
+              const free = availability.get(s.startIso)
+              const sel = selectedIso === s.startIso
+              return (
+                <button key={s.startIso} className={`slot-btn ${free ? 'free' : 'busy'} ${sel ? 'selected' : ''}`} disabled={!free} onClick={() => pick(s)} title={`${format(s.start,'HH:mm')}–${format(s.end,'HH:mm')}`}>
+                  {format(s.start,'HH:mm')}
+                </button>
+              )
+            })}
+          </div>
         </div>
       )}
 
@@ -384,35 +391,53 @@ export default function TimeSlotPicker({
       </div>
 
       <style jsx>{`
-        .gba-card{background:#0a1a22;color:#dff3ff;border:2px solid #234;border-radius:12px;padding:12px;box-shadow:0 0 0 2px #112 inset,0 8px 24px rgba(0,0,0,.4);font-family:'Press Start 2P',monospace;}
-        .header .title{display:flex;gap:8px;align-items:center;font-size:14px}
-        .header .sub{opacity:.8;font-size:12px;margin-top:4px;text-transform:capitalize}
+        .gba-card{background:#0a1a22;color:#dff3ff;border:2px solid #234;border-radius:12px;padding:20px;box-shadow:0 0 0 2px #112 inset,0 8px 24px rgba(0,0,0,.4);font-family:'Press Start 2P',monospace;max-width:100%;box-sizing:border-box;}
+        .header{text-align:center;margin-bottom:16px;}
+        .header .title{display:inline-flex;gap:8px;align-items:center;font-size:14px;justify-content:center;}
+        .header .sub{opacity:.8;font-size:12px;margin-top:8px;text-transform:capitalize;}
         .pixel{letter-spacing:.5px}
-        .section{margin-top:10px}.label{font-size:11px;opacity:.9;margin-bottom:6px}
-        .dial{position:relative;width:160px;height:160px;background:radial-gradient(ellipse at center,#0f2830 40%,#0a1a22 60%);border:1px solid #234;border-radius:50%;box-shadow:inset 0 0 8px rgba(0,0,0,.5);margin-bottom:8px}
+        .section{margin:16px auto;max-width:100%;width:fit-content;}
+        .label{font-size:11px;opacity:.9;margin-bottom:8px;text-align:center;}
+        .dial{position:relative;width:160px;height:160px;background:radial-gradient(ellipse at center,#0f2830 40%,#0a1a22 60%);border:1px solid #234;border-radius:50%;box-shadow:inset 0 0 8px rgba(0,0,0,.5);margin:0 auto 16px;}
         .dial-center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:84px;height:84px;border-radius:50%;background:#081820;border:1px solid #345;display:flex;align-items:center;justify-content:center;box-shadow:inset 0 0 10px rgba(0,0,0,.6)}
         .dial-value{font-size:16px;display:flex;align-items:flex-end;gap:4px}.dial-value small{font-size:10px;opacity:.8}
-        .dial-item{position:absolute;width:40px;height:40px;border-radius:50%;background:#123;border:1px solid #345;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);transition:transform .15s ease,background .15s ease,box-shadow .15s ease}
+        .dial-item{position:absolute;width:40px;height:40px;border-radius:50%;background:#123;border:1px solid #345;color:#cfe;display:flex;align-items:center;justify-content:center;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);transition:transform .15s ease,background .15s ease,box-shadow .15s ease;cursor:pointer;}
         .dial-item:hover{transform:scale(1.06)}.dial-item.active{background:#0f3340;border-color:#5fc;box-shadow:0 0 0 2px #5fc inset}
-        .step{font-size:11px;opacity:.95;margin-top:10px}
-        .hours-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-        .hour-chip{background:#123;border:1px solid #285;color:#cfe;padding:8px 10px;border-radius:10px;font-size:12px;display:inline-flex;align-items:center;gap:8px}
+        .step{font-size:11px;opacity:.95;margin:16px 0 8px;text-align:center;}
+
+        /* centrado + sin scrollbars visibles */
+        .hours-container,.slots-container{width:100%;overflow-x:auto;padding:4px 0;scrollbar-width:none;}
+        .hours-container::-webkit-scrollbar,.slots-container::-webkit-scrollbar{display:none}
+        .hours-row,.slots-row{display:flex;gap:10px;justify-content:center;flex-wrap:nowrap;padding:4px 0;min-width:min-content;}
+
+        .hour-chip{background:#123;border:1px solid #285;color:#cfe;padding:10px 14px;border-radius:12px;font-size:12px;display:inline-flex;align-items:center;gap:8px;white-space:nowrap;flex-shrink:0;}
         .hour-chip .badge{background:#285;color:#021;padding:2px 6px;border-radius:6px;font-weight:700;font-size:11px}
-        .hour-chip.active{outline:2px solid #5fc;background:#0f3340}
-        .hour-chip:disabled{opacity:.45;filter:grayscale(1)}
-        .slots-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-        .slot-btn{min-width:72px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid #234}
-        .slot-btn.free{background:#0d2a33;color:#def;border-color:#285}.slot-btn.busy{background:#1a1f24;color:#789;cursor:not-allowed;text-decoration:line-through}
-        .slot-btn.selected{outline:2px solid #5fc}
-        .confirm-panel{margin-top:14px;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start}
-        .summary .line{font-size:12px}.summary .actions{display:flex;gap:8px;margin-top:8px}
-        .btn-primary{background:#2a6;color:#021;border:1px solid #5fc;padding:8px 12px;border-radius:8px}
-        .btn-ghost{background:transparent;color:#cfe;border:1px dashed #345;padding:8px 12px;border-radius:8px}
-        .qr-wrap{display:flex;align-items:center;gap:10px;padding:8px;background:#081820;border:1px solid #234;border-radius:10px}
-        .qr-img{width:112px;height:112px;image-rendering:pixelated}.code{display:flex;align-items:center;gap:8px;font-size:12px}
-        .copy{background:#123;border:1px solid #345;color:#cfe;padding:4px 6px;border-radius:6px}.muted{opacity:.7}
-        .spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-        .confirm-ok{margin-top:6px;font-size:11px;color:#9ff59f}
+        .hour-chip.active{outline:2px solid #5fc;background:#0f3340;}
+        .hour-chip:disabled{opacity:.38;filter:grayscale(1);cursor:not-allowed;}
+
+        .slot-btn{min-width:80px;padding:10px 12px;border-radius:10px;font-size:12px;border:1px solid #234;flex-shrink:0;}
+        .slot-btn.free{background:#0d2a33;color:#def;border-color:#285;cursor:pointer;}
+        .slot-btn.busy{background:#1a1f24;color:#789;cursor:not-allowed;text-decoration:line-through;}
+        .slot-btn.selected{outline:2px solid #5fc;}
+
+        .confirm-panel{margin-top:20px;display:flex;flex-direction:column;align-items:center;gap:16px;width:100%;}
+        .summary{width:100%;max-width:540px;text-align:center;}
+        .summary .line{font-size:12px;margin-bottom:12px;}
+        .summary .actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:12px;}
+        .btn-primary{background:#2a6;color:#021;border:1px solid #5fc;padding:10px 16px;border-radius:10px;cursor:pointer;transition:opacity 0.2s;}
+        .btn-primary:hover{opacity:0.9;}
+        .btn-ghost{background:transparent;color:#cfe;border:1px dashed #345;padding:10px 16px;border-radius:10px;cursor:pointer;transition:background 0.2s;}
+        .btn-ghost:hover{background:rgba(255,255,255,0.05);}
+
+        .qr-wrap{display:flex;align-items:center;gap:16px;padding:12px;background:#081820;border:1px solid #234;border-radius:10px;margin-top:12px;}
+        .qr-img{width:112px;height:112px;image-rendering:pixelated;flex-shrink:0;}
+        .code{display:flex;align-items:center;gap:8px;font-size:12px;}
+        .copy{background:#123;border:1px solid #345;color:#cfe;padding:4px 8px;border-radius:6px;cursor:pointer;transition:background 0.2s;}
+        .copy:hover{background:#1a2f3a;}
+        .muted{opacity:.7;}
+        .spin{animation:spin 1s linear infinite;}
+        @keyframes spin{to{transform:rotate(360deg);}}
+        .confirm-ok{margin-top:10px;font-size:11px;color:#9ff59f;text-align:center;}
       `}</style>
     </div>
   )
