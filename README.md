@@ -48,3 +48,4 @@
 - **tickets**: Los usuarios pueden leer sus propios tickets, los administradores pueden leer/escribir todos
 
 > Próximo: conectar Functions + Webhook de MercadoPago para aprobar pagos reales.
+# dojoGamingAccess
