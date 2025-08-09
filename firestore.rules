@@ -1,0 +1,96 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if user is admin
+    function isAdmin() {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles != null &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.admin == true;
+    }
+
+    // Allow read access to authenticated users for most collections
+    match /{document=**} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+    
+    // Public read access to resources
+    match /resources/{resourceId} {
+      allow read: true;  // Public read access
+      allow write: if isAdmin();
+    }
+    
+    // Public read access to events
+    match /events/{eventId} {
+      allow read: true;  // Public read access
+      allow write: if isAdmin();
+      
+      // Allow users to query events collection
+      match /{document=**} {
+        allow read: true;
+        allow write: if isAdmin();
+      }
+    }
+    
+    // Bookings rules
+    match /bookings/{bookingId} {
+      // Allow users to read their own bookings
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.userId || 
+        isAdmin()
+      );
+      
+      // Allow creating bookings with proper user ID
+      allow create: if request.auth != null && 
+                   request.auth.uid == request.resource.data.userId;
+      
+      // Allow updating booking status (for payment confirmation, etc.)
+      allow update: if request.auth != null && (
+        isAdmin() ||
+        (request.auth.uid == resource.data.userId && 
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
+      );
+      
+      // Only admins can delete bookings
+      allow delete: if isAdmin();
+      
+      // Subcollections
+      match /{document=**} {
+        allow read: if request.auth != null && (
+          request.auth.uid == get(/databases/$(database)/documents/bookings/$(bookingId)).data.userId ||
+          isAdmin()
+        );
+        allow write: if isAdmin();
+      }
+    }
+    
+    // Tickets rules
+    match /tickets/{ticketId} {
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.userId || 
+        isAdmin()
+      );
+      allow write: if isAdmin();
+    }
+    
+    // User profiles
+    match /users/{userId} {
+      // Users can read/write their own profile
+      allow read: if request.auth != null && (
+        request.auth.uid == userId || 
+        isAdmin()
+      );
+      
+      // Users can update their own profile, but not their roles
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && (
+        request.auth.uid == userId ||
+        isAdmin()
+      ) && (
+        isAdmin() ||
+        !('roles' in request.resource.data.diff(resource.data).affectedKeys())
+      );
+    }
+  }
+}

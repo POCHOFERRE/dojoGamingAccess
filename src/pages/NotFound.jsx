@@ -1,0 +1,1 @@
+export default function NotFound(){return(<div className='card'><h2>404</h2><p>No encontramos esa página.</p></div>)}
